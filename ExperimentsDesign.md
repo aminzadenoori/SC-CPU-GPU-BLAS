@@ -39,22 +39,30 @@ This experiment **extends that work** in one specific direction it deliberately 
 |---|---|---|
 | Workflow | Seurat 5 (R), OSCA (R), scrapper (R), Scanpy (Python), rapids singlecell (Python/GPU) | First four are CPU/BLAS-dependent; rapids singlecell is the GPU gold standard |
 | CPU BLAS/LAPACK backend | see §5 | Primary factor for Phase 1; applies to both R and Scanpy |
-| Hardware platform | **AMD EPYC 9654 (Zen 4 / Genoa, 96 cores, 768 GB) + NVIDIA GPU** primary → Intel → Apple M | Staged, §9; node in §3.1. GPU arm needs an NVIDIA card |
+| Hardware platform | **CPU node: 2× EPYC 9654 (Zen 4, 192 physical / 384 logical cores, 768 GB); GPU node: 2× EPYC 9135 (Zen 5, 1.5 TB) + NVIDIA H200 NVL 141 GB HBM3** → Intel → Apple M | Two separate machines; see §3.1 |
 | Dataset | BE1, sc mixology, cord blood, 1.3M | §4 |
 | Dataset size | full; plus 100k / 500k / 1M subsamples of 1.3M | Scalability sweep |
-| Thread count | 1, 2, 4, 8, 16, 32, 48, 64, 96 (and SMT 192) | Crossed with backend; full sweep to 96 physical cores |
+| Thread count | 1, 2, 4, 8, 16, 32, 64, 96, 128, 192 (and SMT to 384) | Crossed with backend; sweep to 192 physical / 384 logical on the CPU node |
 | Repetitions | ≥ 5 timed runs per cell of the matrix | For variance, §11 |
 
 **Unified harness via reticulate.** The whole benchmark is orchestrated from R. The R workflows run natively; the Python workflows (Scanpy and rapids singlecell) are invoked through the **reticulate** package, as done in the source preprint, so all five pipelines share one driver, one set of input matrices, and one timing/logging path. This keeps the CPU↔GPU and R↔Python comparisons clean and removes harness-level confounds.
 
-### 3.1 Primary hardware node (AMD phase)
+### 3.1 Hardware nodes
 
-The primary CPU node is a single **AMD EPYC 9654 (Zen 4, "Genoa")**: 96 physical cores / 192 threads, 768 GB RAM, paired with an NVIDIA GPU for the rapids singlecell arm. The microarchitectural facts that shape the design:
+The CPU workflows and the GPU workflow run on two separate machines, exactly as in the source benchmark.
 
-- **AVX-512 support.** Zen 4 implements AVX-512 (double-pumped 256-bit datapath). Architecture-tuned libraries must be built with the **`zen4` target** (OpenBLAS Zen4 kernels, AOCL-BLIS Zen4, BLIS `zen4`) to use AVX-512, and the oneMKL dispatch question becomes **default vs forced AVX-512 vs forced AVX2** (see §5).
-- **NUMA / chiplet layout.** Genoa exposes 12 CCDs and a configurable Nodes-Per-Socket (NPS1/2/4). NUMA placement strongly affects BLAS throughput at high thread counts, so the **NPS setting is recorded and held fixed**, with NUMA-aware thread/memory pinning (§10).
-- **768 GB RAM.** The full 1.3M-cell dataset fits comfortably in host memory, so on the **CPU side there is no out-of-core requirement** — only the **GPU** arm faces VRAM limits requiring batching (§7). Any CPU slowdown is therefore compute, not paging.
-- **Thread sweep.** Strong-scaling across 1→96 physical cores, plus a 192-thread SMT point to test whether SMT helps or hurts each BLAS (it often hurts compute-bound GEMM).
+**CPU node (BLAS sweep — Phase 1).** Dual-socket **AMD EPYC 9654 (Zen 4, "Genoa")** — 96 cores per socket, **192 physical / 384 logical cores total** — with **768 GB RAM and no GPU**. Design implications:
+
+- **AVX-512.** Zen 4 implements AVX-512 (double-pumped 256-bit datapath). Tuned libraries must target **`zen4`** (OpenBLAS Zen4 kernels, AOCL-BLIS Zen4, BLIS `zen4`); the oneMKL question is default vs forced AVX-512 vs forced AVX2 (§5).
+- **Dual-socket NUMA.** Two sockets, each with Genoa's 12-CCD layout and configurable NPS (NPS1/2/4), make NUMA placement critical at high thread counts. The **socket count, NPS, and pinning are recorded and held fixed**, with NUMA-aware thread/memory binding (§10); cross-socket memory traffic is a first-order effect to watch when scaling past ~96 threads onto the second socket.
+- **768 GB RAM.** The full 1.3M dataset fits in host memory, so the CPU side has **no out-of-core requirement** — any CPU slowdown is compute, not paging.
+- **Thread sweep.** 1→192 physical cores, plus an SMT point at 384 logical cores to test whether SMT helps or hurts each BLAS (it usually hurts compute-bound GEMM).
+- **No local GPU.** This node has no NVIDIA card, so the GPU-offload backend (NVBLAS, backend 8) and rapids singlecell **cannot run here** — they run on the GPU node below.
+
+**GPU node (rapids singlecell + NVBLAS).** Dual-socket **AMD EPYC 9135 (Zen 5, "Turin")**, **1.5 TB RAM**, and one **NVIDIA H200 NVL with 141 GB HBM3 memory**. Implications:
+
+- **141 GB VRAM removes the out-of-core problem.** All four datasets, including 1.3M, fit comfortably in VRAM (the HVG matrix for 1.3M is only a few GB dense), so rapids singlecell runs **fully in-VRAM with no batching** — unlike the A100/P100 (40/16 GB) used in the source preprint, where VRAM was a binding constraint. This strengthens the gold-standard timing: no host↔device paging overhead.
+- **Different host CPU.** The GPU node's host is **Zen 5 EPYC 9135**, not the Zen 4 9654 of the CPU node. Pure GPU-step timings are comparable across nodes, but any **host-side / CPU-fallback work is not apples-to-apples**. NVBLAS in particular runs against the 9135 host BLAS here, so its CPU baseline is **re-measured on this node** for a fair within-node comparison (§5).
 
 ## 4. Datasets (held constant across all backends)
 
@@ -89,7 +97,7 @@ For each backend we additionally vary the **threading configuration** (single-th
 - It only accelerates the GEMM-heavy steps (scaling, PC projection, parts of PCA); graph and gradient-descent steps see no benefit, matching the §6.2 sensitivity map.
 - The **host-BLAS fallback is a sub-factor**: NVBLAS-over-OpenBLAS and NVBLAS-over-AOCL are distinct configurations, both tested.
 
-Conceptually this gives a **three-rung GPU-acceleration spectrum**: (i) CPU-only BLAS → (ii) NVBLAS = drop-in GPU offload of the unmodified workflows, no algorithmic change → (iii) **rapids singlecell** = a fully GPU-native pipeline (the gold standard). The contrast between (ii) and (iii) shows how much is gained by a GPU-native pipeline versus just offloading the BLAS layer of the existing CPU workflows.
+Conceptually this gives a **three-rung GPU-acceleration spectrum**: (i) CPU-only BLAS → (ii) NVBLAS = drop-in GPU offload of the unmodified workflows, no algorithmic change → (iii) **rapids singlecell** = a fully GPU-native pipeline (the gold standard). The contrast between (ii) and (iii) shows how much is gained by a GPU-native pipeline versus just offloading the BLAS layer of the existing CPU workflows. Because NVBLAS needs a local NVIDIA GPU, **backend 8 is evaluated on the GPU node (§3.1)**, with its host-BLAS fallback baseline re-measured on that same node (Zen 5 EPYC 9135) rather than compared directly against the EPYC 9654 numbers.
 
 ## 6. The CPU workflows — step-by-step specification and differences
 
@@ -143,8 +151,8 @@ Design requirements for a fair comparison:
 - **Driven from R via reticulate**, in the same harness as the R workflows (as in the source preprint), so input matrices, parameters, and timing are shared.
 - **Parameter-matched to mode B** (50 PCs, matched neighbors/resolution/perplexity) so accuracy and concordance are comparable to the CPU workflows.
 - **Treated as the speed reference, not numerical ground truth** — GPU FMA ordering, atomics, and optional reduced precision make exact CPU reproduction impossible; biological labels remain the accuracy reference.
-- **VRAM strategy for 1.3M:** rapids singlecell needs the data to fit in VRAM; batching/out-of-core or a subsample ceiling is recorded as a constraint with its overhead. This is a GPU-only limit (the 768 GB host holds the full dataset).
-- **Availability:** the GPU arm requires an NVIDIA card, so it is present in the AMD and Intel phases but **absent on Apple Silicon**, where the comparison is CPU-only (§9).
+- **VRAM headroom:** the H200 NVL's **141 GB HBM3 holds all four datasets — including 1.3M — entirely in VRAM**, so rapids singlecell runs in-VRAM with no batching or host↔device paging. This is a notable change from the source preprint's A100/P100 GPUs, where VRAM limited the GPU arm; here the gold-standard timing is not penalized by memory transfers.
+- **Availability:** the GPU arm runs on the dedicated GPU node (§3.1); it is **unavailable on Apple Silicon**, where the comparison is CPU-only (§9).
 
 ## 8. Response variables (dependent measures)
 
@@ -182,7 +190,8 @@ Report **median and a dispersion measure (IQR or MAD)** over repeats. For backen
 - **Nested parallelism / oversubscription** (R or Python threads × BLAS threads) on 96 cores produces bogus slowdowns; pin both.
 - **reticulate overhead and Python interpreter startup** can contaminate timings if charged to the GPU step; measure and annotate separately.
 - **rapids singlecell non-determinism** (GPU atomics, FMA ordering, precision) makes exact CPU reproduction impossible; it is a *speed* reference, biology is the *accuracy* reference.
-- **VRAM limits at 1.3M** force batching/out-of-core **on the GPU only** — the 768 GB host holds the full dataset; record GPU batching overhead.
+- **VRAM is not a binding constraint here** — the H200's 141 GB holds 1.3M entirely in VRAM, so unlike the source preprint's smaller GPUs there is no batching overhead to model; the gold standard runs fully in-VRAM.
+- **Two separate nodes with different host CPUs** — the CPU sweep runs on the Zen 4 EPYC 9654 node and the GPU arm on the Zen 5 EPYC 9135 + H200 node. Compare GPU-step and end-to-end numbers with that in mind; do **not** attribute host-side differences (data loading, reticulate marshalling, NVBLAS CPU fallback) to the GPU itself.
 - **No GPU arm on Apple Silicon** — Phase 2 on Apple M is CPU-only; do not compare its rows to GPU rows.
 - **IRLBA vs exact vs randomized SVD** give different PCs even on the same backend — fix the SVD method within a comparison.
 
